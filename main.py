@@ -334,7 +334,7 @@ def health():
     return {
         "status": "ok",
         "time": datetime.now().isoformat(),
-        "env": "serverless" if IS_SERVERLESS else "local",
+        "env": "cloudbase-run",
         "db_path": DB_PATH
     }
 
