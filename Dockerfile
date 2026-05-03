@@ -1,31 +1,35 @@
-# 使用官方 Python 轻量级镜像（alpine 版本体积小，冷启动快）
-FROM python:3-alpine
-
-# 设置时区为上海（您的业务场景需要）
-RUN apk add tzdata && \
-    cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
-    echo Asia/Shanghai > /etc/timezone
+# 使用官方 Python 运行时作为基础镜像
+FROM python:3.11-slim
 
 # 设置工作目录
-ENV APP_HOME /app
-WORKDIR $APP_HOME
+WORKDIR /app
 
-# 拷贝项目文件
+# 安装系统依赖（SQLite 需要）
+RUN apt-get update && apt-get install -y \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置 pip 镜像源（加速下载）
+RUN pip config set global.index-url https://mirrors.cloud.tencent.com/pypi/simple/ \
+    && pip config set global.trusted-host mirrors.cloud.tencent.com
+
+# 复制依赖文件并安装
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
 COPY . .
 
-# 环境变量配置
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV DB_PATH=/app/mms_users.db
+# 创建数据目录（SQLite 持久化）
+RUN mkdir -p /app/data
 
-# 安装依赖（使用腾讯云镜像源加速）
-RUN pip config set global.index-url http://mirrors.cloud.tencent.com/pypi/simple && \
-    pip config set global.trusted-host mirrors.cloud.tencent.com && \
-    pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+# 暴露端口（CloudBase Run 默认 8080）
+EXPOSE 8080
 
-# 暴露端口（必须与云托管控制台配置的端口一致）
-EXPOSE 80
+# 环境变量
+ENV PORT=8080
+ENV DB_DIR=/app/data
+ENV ALLOW_ORIGINS=*
 
-# 使用 uvicorn 启动 FastAPI（生产环境推荐）
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80"]
+# 启动命令
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
