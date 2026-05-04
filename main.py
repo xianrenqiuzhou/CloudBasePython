@@ -1,16 +1,25 @@
 """
 物料管理系统 — 用户认证后端 API
-技术栈：FastAPI + SQLite
+技术栈：FastAPI + MySQL (pymysql)
 运行方式：uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+环境变量（MySQL 连接）：
+  MYSQL_HOST     默认 127.0.0.1
+  MYSQL_PORT     默认 3306
+  MYSQL_USER     默认 root
+  MYSQL_PASSWORD 默认空
+  MYSQL_DATABASE 默认 material_system
 """
 
 import json
+import os
 import secrets
-import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
+import pymysql
+from pymysql.cursors import DictCursor
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -18,11 +27,16 @@ from pydantic import BaseModel
 # ─────────────────────────────────────────────
 # 配置
 # ─────────────────────────────────────────────
-DB_PATH   = "mms_users.db"
-PASS_SALT = ""          # 密码不加密，直接明文存储
-TOKEN_TTL = 7                        # 会话 token 有效天数
+DB_HOST     = os.getenv("MYSQL_HOST", "127.0.0.1")
+DB_PORT     = int(os.getenv("MYSQL_PORT", "3306"))
+DB_USER     = os.getenv("MYSQL_USER", "root")
+DB_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+DB_NAME     = os.getenv("MYSQL_DATABASE", "material_system")
 
-app = FastAPI(title="物料管理系统 API", version="1.0.0")
+PASS_SALT = ""          # 密码不加密，直接明文存储
+TOKEN_TTL = 7           # 会话 token 有效天数
+
+app = FastAPI(title="物料管理系统 API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,58 +47,88 @@ app.add_middleware(
 )
 
 # ─────────────────────────────────────────────
-# 数据库
+# 数据库（MySQL）
 # ─────────────────────────────────────────────
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    """获取 MySQL DictCursor，yield 后自动 commit/close"""
+    conn = pymysql.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        charset="utf8mb4",
+        cursorclass=DictCursor,
+        autocommit=False,
+    )
+    cur = conn.cursor()
     try:
-        yield conn
+        yield cur
         conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _ensure_database():
+    """确保数据库存在（首次启动时创建）"""
+    conn = pymysql.connect(
+        host=DB_HOST, port=DB_PORT, user=DB_USER,
+        password=DB_PASSWORD, charset="utf8mb4",
+        autocommit=True,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"CREATE DATABASE IF NOT EXISTS {DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
     finally:
         conn.close()
 
 
 def init_db():
+    _ensure_database()
     with get_db() as db:
-        db.executescript("""
+        # users 表
+        db.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                phone      TEXT PRIMARY KEY,
-                name       TEXT NOT NULL,
-                password   TEXT NOT NULL,
-                role       TEXT NOT NULL DEFAULT 'user',
-                expire_at  TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-            );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                token      TEXT PRIMARY KEY,
-                phone      TEXT NOT NULL,
-                expire_at  TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-            );
-
-            CREATE TABLE IF NOT EXISTS userdata (
-                phone      TEXT PRIMARY KEY,
-                data       TEXT NOT NULL DEFAULT '{}',
-                updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-            );
+                phone      VARCHAR(255) PRIMARY KEY,
+                name       VARCHAR(255) NOT NULL,
+                password   VARCHAR(255) NOT NULL,
+                role       VARCHAR(50)  NOT NULL DEFAULT 'user',
+                expire_at  DATETIME,
+                created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
-        # 初始化超级管理员（每次启动同步，兼容旧版哈希密码）
-        exists = db.execute(
-            "SELECT 1 FROM users WHERE phone = '13800000000'"
-        ).fetchone()
-        if not exists:
+        # sessions 表
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                token      VARCHAR(255) PRIMARY KEY,
+                phone      VARCHAR(255) NOT NULL,
+                expire_at  DATETIME     NOT NULL,
+                created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_phone (phone)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        # userdata 表（物料等业务数据）
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS userdata (
+                phone      VARCHAR(255) PRIMARY KEY,
+                data       LONGTEXT     NOT NULL DEFAULT '{}',
+                updated_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_updated (updated_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        # 初始化超级管理员
+        db.execute("SELECT 1 FROM users WHERE phone = %s", ("13800000000",))
+        if not db.fetchone():
             db.execute(
-                "INSERT INTO users (phone, name, password, role) VALUES (?,?,?,?)",
+                "INSERT INTO users (phone, name, password, role) VALUES (%s,%s,%s,%s)",
                 ("13800000000", "超级管理员", "123456", "superadmin"),
             )
         else:
-            # 强制更新为明文密码（覆盖旧哈希值）
             db.execute(
-                "UPDATE users SET password = '123456', role = 'superadmin' WHERE phone = '13800000000'"
+                "UPDATE users SET password = %s, role = %s WHERE phone = %s",
+                ("123456", "superadmin", "13800000000"),
             )
 
 
@@ -103,7 +147,7 @@ def make_token(phone: str) -> str:
     expire = (datetime.now() + timedelta(days=TOKEN_TTL)).isoformat()
     with get_db() as db:
         db.execute(
-            "INSERT INTO sessions (token, phone, expire_at) VALUES (?,?,?)",
+            "INSERT INTO sessions (token, phone, expire_at) VALUES (%s,%s,%s)",
             (token, phone, expire),
         )
     return token
@@ -114,8 +158,8 @@ def user_row_to_dict(u) -> dict:
         "phone":     u["phone"],
         "name":      u["name"],
         "role":      u["role"],
-        "expireAt":  u["expire_at"],
-        "createdAt": u["created_at"],
+        "expireAt":  u["expire_at"].isoformat() if u["expire_at"] else None,
+        "createdAt": u["created_at"].isoformat() if u["created_at"] else None,
     }
 
 
@@ -125,9 +169,8 @@ def verify_token(authorization: Optional[str] = Header(None)) -> str:
         raise HTTPException(status_code=401, detail="未提供 Token，请先登录")
     token = authorization[7:]
     with get_db() as db:
-        row = db.execute(
-            "SELECT phone, expire_at FROM sessions WHERE token = ?", (token,)
-        ).fetchone()
+        db.execute("SELECT phone, expire_at FROM sessions WHERE token = %s", (token,))
+        row = db.fetchone()
     if not row:
         raise HTTPException(status_code=401, detail="Token 无效，请重新登录")
     if datetime.fromisoformat(row["expire_at"]) < datetime.now():
@@ -168,14 +211,16 @@ def register(req: RegisterReq):
         raise HTTPException(400, "姓名不能为空")
 
     with get_db() as db:
-        if db.execute("SELECT 1 FROM users WHERE phone=?", (req.phone,)).fetchone():
+        db.execute("SELECT 1 FROM users WHERE phone=%s", (req.phone,))
+        if db.fetchone():
             raise HTTPException(409, "该手机号已注册")
         default_expire = (datetime.now() + timedelta(days=30)).isoformat()
         db.execute(
-            "INSERT INTO users (phone, name, password, expire_at) VALUES (?,?,?,?)",
+            "INSERT INTO users (phone, name, password, expire_at) VALUES (%s,%s,%s,%s)",
             (req.phone, req.name.strip(), hash_pass(req.password), default_expire),
         )
-        user = db.execute("SELECT * FROM users WHERE phone=?", (req.phone,)).fetchone()
+        db.execute("SELECT * FROM users WHERE phone=%s", (req.phone,))
+        user = db.fetchone()
 
     token = make_token(req.phone)
     return {"token": token, "user": user_row_to_dict(user)}
@@ -184,7 +229,8 @@ def register(req: RegisterReq):
 @app.post("/api/auth/login", summary="登录")
 def login(req: LoginReq):
     with get_db() as db:
-        user = db.execute("SELECT * FROM users WHERE phone=?", (req.phone,)).fetchone()
+        db.execute("SELECT * FROM users WHERE phone=%s", (req.phone,))
+        user = db.fetchone()
 
     if not user:
         raise HTTPException(404, "手机号未注册，请先注册")
@@ -193,8 +239,8 @@ def login(req: LoginReq):
 
     # 校验账号有效期
     if user["expire_at"]:
-        if datetime.fromisoformat(user["expire_at"]) < datetime.now():
-            exp_date = datetime.fromisoformat(user["expire_at"]).strftime("%Y-%m-%d")
+        if datetime.fromisoformat(user["expire_at"].isoformat() if hasattr(user["expire_at"], 'isoformat') else str(user["expire_at"])) < datetime.now():
+            exp_date = user["expire_at"].strftime("%Y-%m-%d") if hasattr(user["expire_at"], 'strftime') else str(user["expire_at"])[:10]
             raise HTTPException(403, f"账号授权已于 {exp_date} 到期，请联系管理员续期")
 
     token = make_token(req.phone)
@@ -204,7 +250,8 @@ def login(req: LoginReq):
 @app.get("/api/auth/verify", summary="验证当前 Token")
 def verify(phone: str = Depends(verify_token)):
     with get_db() as db:
-        user = db.execute("SELECT * FROM users WHERE phone=?", (phone,)).fetchone()
+        db.execute("SELECT * FROM users WHERE phone=%s", (phone,))
+        user = db.fetchone()
     if not user:
         raise HTTPException(404, "用户不存在")
     return user_row_to_dict(user)
@@ -215,31 +262,33 @@ def logout(authorization: Optional[str] = Header(None)):
     if authorization and authorization.startswith("Bearer "):
         token = authorization[7:]
         with get_db() as db:
-            db.execute("DELETE FROM sessions WHERE token=?", (token,))
+            db.execute("DELETE FROM sessions WHERE token=%s", (token,))
     return {"success": True}
 
 
 @app.get("/api/users", summary="用户列表（管理员）")
 def list_users(phone: str = Depends(verify_token)):
     with get_db() as db:
-        me = db.execute("SELECT * FROM users WHERE phone=?", (phone,)).fetchone()
+        db.execute("SELECT * FROM users WHERE phone=%s", (phone,))
+        me = db.fetchone()
         if not me or me["role"] not in ("admin", "superadmin"):
             raise HTTPException(403, "无权限")
         if me["role"] == "superadmin":
-            rows = db.execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()
+            db.execute("SELECT * FROM users ORDER BY created_at DESC")
+            rows = db.fetchall()
         else:
-            # 普通管理员只能看普通用户
-            rows = db.execute(
-                "SELECT * FROM users WHERE role='user' OR role IS NULL ORDER BY created_at DESC"
-            ).fetchall()
+            db.execute("SELECT * FROM users WHERE role='user' OR role IS NULL ORDER BY created_at DESC")
+            rows = db.fetchall()
     return [user_row_to_dict(u) for u in rows]
 
 
 @app.put("/api/users/{target_phone}/expiry", summary="设置授权有效期")
 def set_expiry(target_phone: str, req: SetExpiryReq, phone: str = Depends(verify_token)):
     with get_db() as db:
-        me     = db.execute("SELECT * FROM users WHERE phone=?", (phone,)).fetchone()
-        target = db.execute("SELECT * FROM users WHERE phone=?", (target_phone,)).fetchone()
+        db.execute("SELECT * FROM users WHERE phone=%s", (phone,))
+        me     = db.fetchone()
+        db.execute("SELECT * FROM users WHERE phone=%s", (target_phone,))
+        target = db.fetchone()
 
         if not me or me["role"] not in ("admin", "superadmin"):
             raise HTTPException(403, "无权限")
@@ -257,12 +306,12 @@ def set_expiry(target_phone: str, req: SetExpiryReq, phone: str = Depends(verify
         else:
             base = datetime.now()
             if target["expire_at"]:
-                t = datetime.fromisoformat(target["expire_at"])
+                t = datetime.fromisoformat(target["expire_at"].isoformat() if hasattr(target["expire_at"], 'isoformat') else str(target["expire_at"]))
                 if t > datetime.now():
                     base = t
             new_expire = (base + timedelta(days=req.days)).isoformat()
 
-        db.execute("UPDATE users SET expire_at=? WHERE phone=?", (new_expire, target_phone))
+        db.execute("UPDATE users SET expire_at=%s WHERE phone=%s", (new_expire, target_phone))
 
     return {"success": True, "expireAt": new_expire}
 
@@ -273,8 +322,10 @@ def set_role(target_phone: str, req: SetRoleReq, phone: str = Depends(verify_tok
         raise HTTPException(400, "角色只能为 user 或 admin")
 
     with get_db() as db:
-        me     = db.execute("SELECT * FROM users WHERE phone=?", (phone,)).fetchone()
-        target = db.execute("SELECT * FROM users WHERE phone=?", (target_phone,)).fetchone()
+        db.execute("SELECT * FROM users WHERE phone=%s", (phone,))
+        me = db.fetchone()
+        db.execute("SELECT * FROM users WHERE phone=%s", (target_phone,))
+        target = db.fetchone()
 
         if not me or me["role"] != "superadmin":
             raise HTTPException(403, "仅超级管理员可修改角色")
@@ -285,7 +336,7 @@ def set_role(target_phone: str, req: SetRoleReq, phone: str = Depends(verify_tok
         if phone == target_phone:
             raise HTTPException(400, "不能修改自己的角色")
 
-        db.execute("UPDATE users SET role=? WHERE phone=?", (req.role, target_phone))
+        db.execute("UPDATE users SET role=%s WHERE phone=%s", (req.role, target_phone))
 
     return {"success": True}
 
@@ -300,22 +351,19 @@ def get_data(
     phone: str = Depends(verify_token),
     x_data_owner: Optional[str] = Header(None, alias="X-Data-Owner")
 ):
-    # 子账号可通过 X-Data-Owner 指定父账号手机号，读取父账号数据
     target_phone = x_data_owner if x_data_owner else phone
-    # 轻量同步检测模式：仅返回版本号，不传输全量数据
     sync_check = request.query_params.get("sync_check") == "1"
     with get_db() as db:
-        row = db.execute(
-            "SELECT data, updated_at FROM userdata WHERE phone=?", (target_phone,)
-        ).fetchone()
+        db.execute("SELECT data, updated_at FROM userdata WHERE phone=%s", (target_phone,))
+        row = db.fetchone()
     if not row:
         if sync_check:
             return {"dataVersion": "0"}
         return {"materials": [], "transactions": [], "logs": [], "codeCounter": 0, "customTypeRules": [], "customMaterialTypes": [], "customUnits": ["个","片","条","套","卷","批","根","块"], "materialPresets": []}
     data = json.loads(row["data"]) if not sync_check else {}
     if sync_check:
-        return {"dataVersion": row["updated_at"] or "0"}
-    data["dataVersion"] = row["updated_at"] or "0"
+        return {"dataVersion": row["updated_at"].isoformat() if hasattr(row["updated_at"], 'isoformat') else str(row["updated_at"]) or "0"}
+    data["dataVersion"] = row["updated_at"].isoformat() if hasattr(row["updated_at"], 'isoformat') else str(row["updated_at"]) or "0"
     return data
 
 
@@ -327,19 +375,16 @@ async def save_data(
 ):
     body = await request.json()
     now  = datetime.now().isoformat()
-    # 子账号可通过 X-Data-Owner 将数据保存到父账号下
     target_phone = x_data_owner if x_data_owner else phone
     with get_db() as db:
-        # 先读取现有数据（如果有），与新数据合并，防止覆盖配置字段
-        row = db.execute("SELECT data FROM userdata WHERE phone=?", (target_phone,)).fetchone()
+        db.execute("SELECT data FROM userdata WHERE phone=%s", (target_phone,))
+        row = db.fetchone()
         existing = json.loads(row["data"]) if row else {}
-        # 合并：保留现有配置字段（如 subAccounts, navPermissions），新数据覆盖业务字段
         merged = {**existing, **body}
-        # 写入数据版本号（用于多设备同步检测）
         merged["dataVersion"] = now
         db.execute(
-            """INSERT INTO userdata (phone, data, updated_at) VALUES (?,?,?)
-               ON CONFLICT(phone) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at""",
+            """INSERT INTO userdata (phone, data, updated_at) VALUES (%s,%s,%s)
+               ON DUPLICATE KEY UPDATE data=VALUES(data), updated_at=VALUES(updated_at)""",
             (target_phone, json.dumps(merged, ensure_ascii=False), now),
         )
     return {"success": True, "savedAt": now, "dataVersion": now}
@@ -358,28 +403,26 @@ def find_subaccount(sub_phone: str):
     """遍历所有用户的 userdata，查找 subAccounts 中包含该手机号的记录。
     匿名访问（登录前查询），找到后自动为子账号创建有效 session token。"""
     with get_db() as db:
-        rows = db.execute("SELECT phone, data FROM userdata").fetchall()
+        db.execute("SELECT phone, data FROM userdata")
+        rows = db.fetchall()
         for row in rows:
             data = json.loads(row["data"])
             subs = data.get("subAccounts", [])
             for sub in subs:
                 if str(sub.get("phone", "")) == sub_phone:
                     parent_phone = row["phone"]
-                    # 为子账号创建独立的 session token
                     token = secrets.token_hex(32)
                     expire = (datetime.now() + timedelta(days=TOKEN_TTL)).isoformat()
                     db.execute(
-                        "INSERT INTO sessions (token, phone, expire_at) VALUES (?,?,?)",
+                        "INSERT INTO sessions (token, phone, expire_at) VALUES (%s,%s,%s)",
                         (token, parent_phone, expire),
                     )
-                    db.commit()
-                    parent = db.execute(
-                        "SELECT phone, name, expire_at FROM users WHERE phone=?", (parent_phone,)
-                    ).fetchone()
+                    db.execute("SELECT phone, name, expire_at FROM users WHERE phone=%s", (parent_phone,))
+                    parent = db.fetchone()
                     return {
                         "parentPhone": parent_phone,
                         "parentName": parent["name"] if parent else parent_phone,
-                        "expireAt": parent["expire_at"] if parent else None,
+                        "expireAt": parent["expire_at"].isoformat() if parent and parent["expire_at"] else None,
                         "subAccount": sub,
                         "token": token
                     }
@@ -395,13 +438,13 @@ async def save_subaccounts(
     subs = body.get("subAccounts", [])
     now  = datetime.now().isoformat()
     with get_db() as db:
-        # 读取现有数据
-        row = db.execute("SELECT data FROM userdata WHERE phone=?", (phone,)).fetchone()
+        db.execute("SELECT data FROM userdata WHERE phone=%s", (phone,))
+        row = db.fetchone()
         data = json.loads(row["data"]) if row else {}
         data["subAccounts"] = subs
         db.execute(
-            """INSERT INTO userdata (phone, data, updated_at) VALUES (?,?,?)
-               ON CONFLICT(phone) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at""",
+            """INSERT INTO userdata (phone, data, updated_at) VALUES (%s,%s,%s)
+               ON DUPLICATE KEY UPDATE data=VALUES(data), updated_at=VALUES(updated_at)""",
             (phone, json.dumps(data, ensure_ascii=False), now),
         )
     return {"success": True, "savedAt": now}
@@ -412,4 +455,9 @@ async def save_subaccounts(
 # ─────────────────────────────────────────────
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "time": datetime.now().isoformat()}
+    return {"status": "ok", "db": "mysql", "time": datetime.now().isoformat()}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
