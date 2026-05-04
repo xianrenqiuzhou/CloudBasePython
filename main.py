@@ -38,9 +38,16 @@ TOKEN_TTL = 7           # 会话 token 有效天数
 
 app = FastAPI(title="物料管理系统 API", version="2.0.0")
 
+# 数据库初始化状态
+db_initialized = False
+db_init_error = None
+
+# 启动时打印配置（不连接数据库，仅用于诊断）
+print(f"[STARTUP] MySQL Config: host={DB_HOST}, port={DB_PORT}, user={DB_USER}, db={DB_NAME}, has_password={bool(DB_PASSWORD)}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],             # 生产环境改为具体域名
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,13 +60,9 @@ app.add_middleware(
 def get_db():
     """获取 MySQL DictCursor，yield 后自动 commit/close"""
     conn = pymysql.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME,
-        charset="utf8mb4",
-        cursorclass=DictCursor,
+        host=DB_HOST, port=DB_PORT, user=DB_USER,
+        password=DB_PASSWORD, database=DB_NAME,
+        charset="utf8mb4", cursorclass=DictCursor,
         autocommit=False,
     )
     cur = conn.cursor()
@@ -80,59 +83,73 @@ def _ensure_database():
     )
     try:
         with conn.cursor() as cur:
-            cur.execute(f"CREATE DATABASE IF NOT EXISTS {DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+            cur.execute(
+                "CREATE DATABASE IF NOT EXISTS %s CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+                (DB_NAME,)
+            )
     finally:
         conn.close()
 
 
 def init_db():
-    _ensure_database()
-    with get_db() as db:
-        # users 表
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                phone      VARCHAR(255) PRIMARY KEY,
-                name       VARCHAR(255) NOT NULL,
-                password   VARCHAR(255) NOT NULL,
-                role       VARCHAR(50)  NOT NULL DEFAULT 'user',
-                expire_at  DATETIME,
-                created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-        # sessions 表
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                token      VARCHAR(255) PRIMARY KEY,
-                phone      VARCHAR(255) NOT NULL,
-                expire_at  DATETIME     NOT NULL,
-                created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_phone (phone)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-        # userdata 表（物料等业务数据）
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS userdata (
-                phone      VARCHAR(255) PRIMARY KEY,
-                data       LONGTEXT     NOT NULL DEFAULT '{}',
-                updated_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                INDEX idx_updated (updated_at)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-        # 初始化超级管理员
-        db.execute("SELECT 1 FROM users WHERE phone = %s", ("13800000000",))
-        if not db.fetchone():
-            db.execute(
-                "INSERT INTO users (phone, name, password, role) VALUES (%s,%s,%s,%s)",
-                ("13800000000", "超级管理员", "123456", "superadmin"),
-            )
-        else:
-            db.execute(
-                "UPDATE users SET password = %s, role = %s WHERE phone = %s",
-                ("123456", "superadmin", "13800000000"),
-            )
+    """初始化数据库表结构（按需执行，失败不阻塞启动）"""
+    global db_initialized, db_init_error
+    if db_initialized:
+        return
+    try:
+        _ensure_database()
+        with get_db() as db:
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    phone      VARCHAR(255) PRIMARY KEY,
+                    name       VARCHAR(255) NOT NULL,
+                    password   VARCHAR(255) NOT NULL,
+                    role       VARCHAR(50)  NOT NULL DEFAULT 'user',
+                    expire_at  DATETIME,
+                    created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token      VARCHAR(255) PRIMARY KEY,
+                    phone      VARCHAR(255) NOT NULL,
+                    expire_at  DATETIME     NOT NULL,
+                    created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_phone (phone)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS userdata (
+                    phone      VARCHAR(255) PRIMARY KEY,
+                    data       LONGTEXT     NOT NULL DEFAULT '{}',
+                    updated_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_updated (updated_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            db.execute("SELECT 1 FROM users WHERE phone = %s", ("13800000000",))
+            if not db.fetchone():
+                db.execute(
+                    "INSERT INTO users (phone, name, password, role) VALUES (%s,%s,%s,%s)",
+                    ("13800000000", "超级管理员", "123456", "superadmin"),
+                )
+            else:
+                db.execute(
+                    "UPDATE users SET password = %s, role = %s WHERE phone = %s",
+                    ("123456", "superadmin", "13800000000"),
+                )
+        db_initialized = True
+        print(f"[DB] MySQL 初始化成功: {DB_HOST}:{DB_PORT}/{DB_NAME}")
+    except Exception as e:
+        db_init_error = str(e)
+        print(f"[DB] MySQL 初始化失败: {e}")
 
 
-init_db()
+# 延迟初始化中间件：在首次请求时触发数据库初始化（避免启动时崩溃）
+@app.middleware("http")
+async def lazy_init(request, call_next):
+    if not db_initialized and db_init_error is None:
+        init_db()
+    return await call_next(request)
 
 
 # ─────────────────────────────────────────────
@@ -451,11 +468,32 @@ async def save_subaccounts(
 
 
 # ─────────────────────────────────────────────
-# 健康检查
+# 健康检查 & 诊断（不依赖数据库，用于确认部署版本）
 # ─────────────────────────────────────────────
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "db": "mysql", "time": datetime.now().isoformat()}
+    return {
+        "status": "ok",
+        "db": "mysql",
+        "version": "2.0.0",
+        "time": datetime.now().isoformat(),
+        "dbConfigured": DB_HOST != "127.0.0.1" or DB_PASSWORD != "",
+        "dbHost": DB_HOST,
+        "dbName": DB_NAME,
+    }
+
+
+@app.get("/api/config", summary="诊断：查看当前 MySQL 配置（仅确认连接参数，不暴露密码）")
+def config_diagnostic():
+    return {
+        "mysql_host": DB_HOST,
+        "mysql_port": DB_PORT,
+        "mysql_user": DB_USER,
+        "mysql_database": DB_NAME,
+        "has_password": bool(DB_PASSWORD),
+        "db_initialized": db_initialized,
+        "db_init_error": db_init_error,
+    }
 
 
 if __name__ == "__main__":
