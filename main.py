@@ -1,11 +1,12 @@
 """
-物料管理系统 — CloudBase Run 适配版
+物料管理系统 — 用户认证后端 API
+技术栈：FastAPI + SQLite
+运行方式：uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
 import json
 import secrets
 import sqlite3
-import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -15,35 +16,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ─────────────────────────────────────────────
-# CloudBase 适配配置
+# 配置
 # ─────────────────────────────────────────────
-# CloudBase Run 默认注入 PORT 环境变量，默认 8080
-PORT = int(os.getenv("PORT", "8080"))
-# CFS 挂载点（CloudBase 控制台配置后挂载到 /cfs）
-DB_DIR = os.getenv("DB_DIR", "/app/data")  # 本地开发用 /app/data
-DB_PATH = os.path.join(DB_DIR, "mms_users.db")
-# 前端域名（生产环境必须指定，不能再用 *）
-ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
-TOKEN_TTL = 7
-PASS_SALT = ""
+DB_PATH   = "mms_users.db"
+PASS_SALT = ""          # 密码不加密，直接明文存储
+TOKEN_TTL = 7                        # 会话 token 有效天数
 
 app = FastAPI(title="物料管理系统 API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOW_ORIGINS if o.strip()],
+    allow_origins=["*"],             # 生产环境改为具体域名
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ─────────────────────────────────────────────
-# 数据库（SQLite 文件放到持久化目录）
+# 数据库
 # ─────────────────────────────────────────────
 @contextmanager
 def get_db():
-    # 确保目录存在（CloudBase CFS 挂载 /cfs 或 /mnt）
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -53,9 +46,7 @@ def get_db():
     finally:
         conn.close()
 
-# ─────────────────────────────────────────────
-# 初始化数据库（其余代码保持原逻辑）
-# ─────────────────────────────────────────────
+
 def init_db():
     with get_db() as db:
         db.executescript("""
@@ -67,30 +58,38 @@ def init_db():
                 expire_at  TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
             );
+
             CREATE TABLE IF NOT EXISTS sessions (
                 token      TEXT PRIMARY KEY,
                 phone      TEXT NOT NULL,
                 expire_at  TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
             );
+
             CREATE TABLE IF NOT EXISTS userdata (
                 phone      TEXT PRIMARY KEY,
                 data       TEXT NOT NULL DEFAULT '{}',
                 updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
             );
         """)
-        exists = db.execute("SELECT 1 FROM users WHERE phone = '13800000000'").fetchone()
+        # 初始化超级管理员（每次启动同步，兼容旧版哈希密码）
+        exists = db.execute(
+            "SELECT 1 FROM users WHERE phone = '13800000000'"
+        ).fetchone()
         if not exists:
             db.execute(
                 "INSERT INTO users (phone, name, password, role) VALUES (?,?,?,?)",
                 ("13800000000", "超级管理员", "123456", "superadmin"),
             )
         else:
+            # 强制更新为明文密码（覆盖旧哈希值）
             db.execute(
                 "UPDATE users SET password = '123456', role = 'superadmin' WHERE phone = '13800000000'"
             )
 
+
 init_db()
+
 
 # ─────────────────────────────────────────────
 # 工具函数
@@ -229,6 +228,7 @@ def list_users(phone: str = Depends(verify_token)):
         if me["role"] == "superadmin":
             rows = db.execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()
         else:
+            # 普通管理员只能看普通用户
             rows = db.execute(
                 "SELECT * FROM users WHERE role='user' OR role IS NULL ORDER BY created_at DESC"
             ).fetchall()
@@ -295,33 +295,114 @@ def set_role(target_phone: str, req: SetRoleReq, phone: str = Depends(verify_tok
 # ─────────────────────────────────────────────
 
 @app.get("/api/data", summary="读取当前用户物料数据")
-def get_data(phone: str = Depends(verify_token)):
+def get_data(
+    request: Request,
+    phone: str = Depends(verify_token),
+    x_data_owner: Optional[str] = Header(None, alias="X-Data-Owner")
+):
+    # 子账号可通过 X-Data-Owner 指定父账号手机号，读取父账号数据
+    target_phone = x_data_owner if x_data_owner else phone
+    # 轻量同步检测模式：仅返回版本号，不传输全量数据
+    sync_check = request.query_params.get("sync_check") == "1"
     with get_db() as db:
         row = db.execute(
-            "SELECT data FROM userdata WHERE phone=?", (phone,)
+            "SELECT data, updated_at FROM userdata WHERE phone=?", (target_phone,)
         ).fetchone()
     if not row:
-        return {
-            "materials": [],
-            "transactions": [],
-            "logs": [],
-            "codeCounter": 0,
-            "customTypeRules": [],
-            "customUnits": ["个","片","条","套","卷","批","根","块"],
-            "materialPresets": []
-        }
-    return json.loads(row["data"])
+        if sync_check:
+            return {"dataVersion": "0"}
+        return {"materials": [], "transactions": [], "logs": [], "codeCounter": 0, "customTypeRules": [], "customMaterialTypes": [], "customUnits": ["个","片","条","套","卷","批","根","块"], "materialPresets": []}
+    data = json.loads(row["data"]) if not sync_check else {}
+    if sync_check:
+        return {"dataVersion": row["updated_at"] or "0"}
+    data["dataVersion"] = row["updated_at"] or "0"
+    return data
 
 
 @app.put("/api/data", summary="保存当前用户物料数据")
-async def save_data(request: Request, phone: str = Depends(verify_token)):
+async def save_data(
+    request: Request,
+    phone: str = Depends(verify_token),
+    x_data_owner: Optional[str] = Header(None, alias="X-Data-Owner")
+):
     body = await request.json()
     now  = datetime.now().isoformat()
+    # 子账号可通过 X-Data-Owner 将数据保存到父账号下
+    target_phone = x_data_owner if x_data_owner else phone
     with get_db() as db:
+        # 先读取现有数据（如果有），与新数据合并，防止覆盖配置字段
+        row = db.execute("SELECT data FROM userdata WHERE phone=?", (target_phone,)).fetchone()
+        existing = json.loads(row["data"]) if row else {}
+        # 合并：保留现有配置字段（如 subAccounts, navPermissions），新数据覆盖业务字段
+        merged = {**existing, **body}
+        # 写入数据版本号（用于多设备同步检测）
+        merged["dataVersion"] = now
         db.execute(
             """INSERT INTO userdata (phone, data, updated_at) VALUES (?,?,?)
                ON CONFLICT(phone) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at""",
-            (phone, json.dumps(body, ensure_ascii=False), now),
+            (target_phone, json.dumps(merged, ensure_ascii=False), now),
+        )
+    return {"success": True, "savedAt": now, "dataVersion": now}
+
+
+# ─────────────────────────────────────────────
+# 子账号管理
+# ─────────────────────────────────────────────
+
+class SaveSubAccountsReq(BaseModel):
+    subAccounts: list
+
+
+@app.get("/api/subaccounts/{sub_phone}", summary="根据手机号查找子账号")
+def find_subaccount(sub_phone: str):
+    """遍历所有用户的 userdata，查找 subAccounts 中包含该手机号的记录。
+    匿名访问（登录前查询），找到后自动为子账号创建有效 session token。"""
+    with get_db() as db:
+        rows = db.execute("SELECT phone, data FROM userdata").fetchall()
+        for row in rows:
+            data = json.loads(row["data"])
+            subs = data.get("subAccounts", [])
+            for sub in subs:
+                if str(sub.get("phone", "")) == sub_phone:
+                    parent_phone = row["phone"]
+                    # 为子账号创建独立的 session token
+                    token = secrets.token_hex(32)
+                    expire = (datetime.now() + timedelta(days=TOKEN_TTL)).isoformat()
+                    db.execute(
+                        "INSERT INTO sessions (token, phone, expire_at) VALUES (?,?,?)",
+                        (token, parent_phone, expire),
+                    )
+                    db.commit()
+                    parent = db.execute(
+                        "SELECT phone, name, expire_at FROM users WHERE phone=?", (parent_phone,)
+                    ).fetchone()
+                    return {
+                        "parentPhone": parent_phone,
+                        "parentName": parent["name"] if parent else parent_phone,
+                        "expireAt": parent["expire_at"] if parent else None,
+                        "subAccount": sub,
+                        "token": token
+                    }
+    raise HTTPException(404, "子账号不存在")
+
+
+@app.put("/api/subaccounts", summary="保存当前用户的子账号列表")
+async def save_subaccounts(
+    request: Request,
+    phone: str = Depends(verify_token)
+):
+    body = await request.json()
+    subs = body.get("subAccounts", [])
+    now  = datetime.now().isoformat()
+    with get_db() as db:
+        # 读取现有数据
+        row = db.execute("SELECT data FROM userdata WHERE phone=?", (phone,)).fetchone()
+        data = json.loads(row["data"]) if row else {}
+        data["subAccounts"] = subs
+        db.execute(
+            """INSERT INTO userdata (phone, data, updated_at) VALUES (?,?,?)
+               ON CONFLICT(phone) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at""",
+            (phone, json.dumps(data, ensure_ascii=False), now),
         )
     return {"success": True, "savedAt": now}
 
@@ -331,17 +412,4 @@ async def save_data(request: Request, phone: str = Depends(verify_token)):
 # ─────────────────────────────────────────────
 @app.get("/api/health")
 def health():
-    return {
-        "status": "ok",
-        "time": datetime.now().isoformat(),
-        "env": "cloudbase-run",
-        "db_path": DB_PATH
-    }
-
-
-# ─────────────────────────────────────────────
-# 启动入口（CloudBase Run 需要）
-# ─────────────────────────────────────────────
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
+    return {"status": "ok", "time": datetime.now().isoformat()}
