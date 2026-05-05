@@ -6,9 +6,9 @@
 环境变量（MySQL 连接）：
   MYSQL_HOST     默认 127.0.0.1
   MYSQL_PORT     默认 3306
-  MYSQL_USER     默认 root
-  MYSQL_PASSWORD 默认空
-  MYSQL_DATABASE 默认 material_system
+  MYSQL_USER     默认 material
+  MYSQL_PASSWORD 默认 abc518abc@
+  MYSQL_DATABASE 默认 material-system-d5f7ufn08b049d4c
 """
 
 import json
@@ -29,9 +29,9 @@ from pydantic import BaseModel
 # ─────────────────────────────────────────────
 DB_HOST     = os.getenv("MYSQL_HOST", "127.0.0.1")
 DB_PORT     = int(os.getenv("MYSQL_PORT", "3306"))
-DB_USER     = os.getenv("MYSQL_USER", "root")
-DB_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
-DB_NAME     = os.getenv("MYSQL_DATABASE", "material_system")
+DB_USER     = os.getenv("MYSQL_USER", "material")
+DB_PASSWORD = os.getenv("MYSQL_PASSWORD", "abc518abc@")
+DB_NAME     = os.getenv("MYSQL_DATABASE", "material-system-d5f7ufn08b049d4c")
 
 PASS_SALT = ""          # 密码不加密，直接明文存储
 TOKEN_TTL = 7           # 会话 token 有效天数
