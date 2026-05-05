@@ -145,7 +145,7 @@ def init_db():
             db.execute("""
                 CREATE TABLE IF NOT EXISTS userdata (
                     phone      VARCHAR(255) PRIMARY KEY,
-                    data       LONGTEXT,
+                    data       LONGTEXT     NOT NULL DEFAULT '{}',
                     updated_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_updated (updated_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -214,7 +214,10 @@ def verify_token(authorization: Optional[str] = Header(None)) -> str:
         row = db.fetchone()
     if not row:
         raise HTTPException(status_code=401, detail="Token 无效，请重新登录")
-    if datetime.fromisoformat(row["expire_at"]) < datetime.now():
+    exp = row["expire_at"]
+    if isinstance(exp, str):
+        exp = datetime.fromisoformat(exp)
+    if exp < datetime.now():
         raise HTTPException(status_code=401, detail="Token 已过期，请重新登录")
     return row["phone"]
 
@@ -286,8 +289,11 @@ def login(req: LoginReq):
 
     # 校验账号有效期
     if user["expire_at"]:
-        if datetime.fromisoformat(user["expire_at"].isoformat() if hasattr(user["expire_at"], 'isoformat') else str(user["expire_at"])) < datetime.now():
-            exp_date = user["expire_at"].strftime("%Y-%m-%d") if hasattr(user["expire_at"], 'strftime') else str(user["expire_at"])[:10]
+        exp = user["expire_at"]
+        if isinstance(exp, str):
+            exp = datetime.fromisoformat(exp)
+        if exp < datetime.now():
+            exp_date = exp.strftime("%Y-%m-%d") if hasattr(exp, 'strftime') else str(exp)[:10]
             raise HTTPException(403, f"账号授权已于 {exp_date} 到期，请联系管理员续期")
 
     token = make_token(req.phone)
@@ -353,7 +359,9 @@ def set_expiry(target_phone: str, req: SetExpiryReq, phone: str = Depends(verify
         else:
             base = datetime.now()
             if target["expire_at"]:
-                t = datetime.fromisoformat(target["expire_at"].isoformat() if hasattr(target["expire_at"], 'isoformat') else str(target["expire_at"]))
+                t = target["expire_at"]
+                if isinstance(t, str):
+                    t = datetime.fromisoformat(t)
                 if t > datetime.now():
                     base = t
             new_expire = (base + timedelta(days=req.days)).isoformat()
@@ -408,9 +416,11 @@ def get_data(
             return {"dataVersion": "0"}
         return {"materials": [], "transactions": [], "logs": [], "codeCounter": 0, "customTypeRules": [], "customMaterialTypes": [], "customUnits": ["个","片","条","套","卷","批","根","块"], "materialPresets": []}
     data = json.loads(row["data"] or '{}') if not sync_check else {}
+    ts = row["updated_at"]
+    ts_str = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts) if ts else "0"
     if sync_check:
-        return {"dataVersion": row["updated_at"].isoformat() if hasattr(row["updated_at"], 'isoformat') else str(row["updated_at"]) or "0"}
-    data["dataVersion"] = row["updated_at"].isoformat() if hasattr(row["updated_at"], 'isoformat') else str(row["updated_at"]) or "0"
+        return {"dataVersion": ts_str}
+    data["dataVersion"] = ts_str
     return data
 
 
