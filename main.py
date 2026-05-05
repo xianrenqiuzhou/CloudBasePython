@@ -4,7 +4,7 @@
 运行方式：uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 环境变量（MySQL 连接）：
-  MYSQL_HOST     默认 127.0.0.1
+  MYSQL_HOST     默认 172.17.0.5
   MYSQL_PORT     默认 3306
   MYSQL_USER     默认 material
   MYSQL_PASSWORD 默认 abc518abc@
@@ -27,7 +27,7 @@ from pydantic import BaseModel
 # ─────────────────────────────────────────────
 # 配置
 # ─────────────────────────────────────────────
-DB_HOST     = os.getenv("MYSQL_HOST", "127.0.0.1")
+DB_HOST     = os.getenv("MYSQL_HOST", "172.17.0.5")
 DB_PORT     = int(os.getenv("MYSQL_PORT", "3306"))
 DB_USER     = os.getenv("MYSQL_USER", "material")
 DB_PASSWORD = os.getenv("MYSQL_PASSWORD", "abc518abc@")
