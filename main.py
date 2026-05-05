@@ -4,11 +4,11 @@
 运行方式：uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 环境变量（MySQL 连接）：
-  MYSQL_HOST     默认 172.17.0.5
+  MYSQL_HOST     默认 127.0.0.1
   MYSQL_PORT     默认 3306
-  MYSQL_USER     默认 material
-  MYSQL_PASSWORD 默认 abc518abc@
-  MYSQL_DATABASE 默认 material-system-d5f7ufn08b049d4c
+  MYSQL_USER     默认 root
+  MYSQL_PASSWORD 默认空
+  MYSQL_DATABASE 默认 material_system
 """
 
 import json
@@ -27,11 +27,11 @@ from pydantic import BaseModel
 # ─────────────────────────────────────────────
 # 配置
 # ─────────────────────────────────────────────
-DB_HOST     = os.getenv("MYSQL_HOST", "172.17.0.5")
+DB_HOST     = os.getenv("MYSQL_HOST", "127.0.0.1")
 DB_PORT     = int(os.getenv("MYSQL_PORT", "3306"))
-DB_USER     = os.getenv("MYSQL_USER", "material")
-DB_PASSWORD = os.getenv("MYSQL_PASSWORD", "abc518abc@")
-DB_NAME     = os.getenv("MYSQL_DATABASE", "material-system-d5f7ufn08b049d4c")
+DB_USER     = os.getenv("MYSQL_USER", "root")
+DB_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+DB_NAME     = os.getenv("MYSQL_DATABASE", "material_system")
 
 PASS_SALT = ""          # 密码不加密，直接明文存储
 TOKEN_TTL = 7           # 会话 token 有效天数
@@ -171,9 +171,27 @@ def init_db():
 # 延迟初始化中间件：在首次请求时触发数据库初始化（避免启动时崩溃）
 @app.middleware("http")
 async def lazy_init(request, call_next):
-    if not db_initialized and db_init_error is None:
+    """每次请求时检查数据库是否已初始化，失败会重试"""
+    if not db_initialized:
         init_db()
     return await call_next(request)
+
+
+@app.post("/api/init", summary="手动触发数据库初始化（部署后首次调用）")
+def manual_init():
+    """强制重新执行数据库初始化，创建表结构并写入默认超级管理员"""
+    global db_initialized, db_init_error
+    db_initialized = False
+    db_init_error = None
+    init_db()
+    if db_initialized:
+        return {
+            "success": True,
+            "message": "数据库初始化成功",
+            "defaultAccount": {"phone": "13800000000", "password": "123456", "role": "superadmin"}
+        }
+    else:
+        raise HTTPException(500, f"数据库初始化失败: {db_init_error}")
 
 
 # ─────────────────────────────────────────────
