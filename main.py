@@ -145,7 +145,7 @@ def init_db():
             db.execute("""
                 CREATE TABLE IF NOT EXISTS userdata (
                     phone      VARCHAR(255) PRIMARY KEY,
-                    data       LONGTEXT     NOT NULL DEFAULT '{}',
+                    data       LONGTEXT,
                     updated_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_updated (updated_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -171,27 +171,9 @@ def init_db():
 # 延迟初始化中间件：在首次请求时触发数据库初始化（避免启动时崩溃）
 @app.middleware("http")
 async def lazy_init(request, call_next):
-    """每次请求时检查数据库是否已初始化，失败会重试"""
-    if not db_initialized:
+    if not db_initialized and db_init_error is None:
         init_db()
     return await call_next(request)
-
-
-@app.post("/api/init", summary="手动触发数据库初始化（部署后首次调用）")
-def manual_init():
-    """强制重新执行数据库初始化，创建表结构并写入默认超级管理员"""
-    global db_initialized, db_init_error
-    db_initialized = False
-    db_init_error = None
-    init_db()
-    if db_initialized:
-        return {
-            "success": True,
-            "message": "数据库初始化成功",
-            "defaultAccount": {"phone": "13800000000", "password": "123456", "role": "superadmin"}
-        }
-    else:
-        raise HTTPException(500, f"数据库初始化失败: {db_init_error}")
 
 
 # ─────────────────────────────────────────────
@@ -425,7 +407,7 @@ def get_data(
         if sync_check:
             return {"dataVersion": "0"}
         return {"materials": [], "transactions": [], "logs": [], "codeCounter": 0, "customTypeRules": [], "customMaterialTypes": [], "customUnits": ["个","片","条","套","卷","批","根","块"], "materialPresets": []}
-    data = json.loads(row["data"]) if not sync_check else {}
+    data = json.loads(row["data"] or '{}') if not sync_check else {}
     if sync_check:
         return {"dataVersion": row["updated_at"].isoformat() if hasattr(row["updated_at"], 'isoformat') else str(row["updated_at"]) or "0"}
     data["dataVersion"] = row["updated_at"].isoformat() if hasattr(row["updated_at"], 'isoformat') else str(row["updated_at"]) or "0"
