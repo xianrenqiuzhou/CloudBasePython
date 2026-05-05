@@ -45,6 +45,7 @@ db_init_error = None
 # 启动时打印配置（不连接数据库，仅用于诊断）
 print(f"[STARTUP] MySQL Config: host={DB_HOST}, port={DB_PORT}, user={DB_USER}, db={DB_NAME}, has_password={bool(DB_PASSWORD)}")
 
+# CORS 中间件：必须第一个注册，确保所有响应都带跨域头
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,6 +53,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 全局异常处理器：确保 500 错误也带 CORS 头和友好的 JSON 响应
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request, exc):
+    from fastapi.responses import JSONResponse
+    import traceback
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"服务器内部错误: {str(exc)}"},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
 
 # ─────────────────────────────────────────────
 # 数据库（MySQL）
@@ -83,9 +105,11 @@ def _ensure_database():
     )
     try:
         with conn.cursor() as cur:
+            # 数据库名不能用参数化查询（会被加引号导致语法错误）
+            # 使用安全的标识符转义
+            safe_name = DB_NAME.replace('`', '``')
             cur.execute(
-                "CREATE DATABASE IF NOT EXISTS %s CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
-                (DB_NAME,)
+                f"CREATE DATABASE IF NOT EXISTS `{safe_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
             )
     finally:
         conn.close()
@@ -245,9 +269,15 @@ def register(req: RegisterReq):
 
 @app.post("/api/auth/login", summary="登录")
 def login(req: LoginReq):
-    with get_db() as db:
-        db.execute("SELECT * FROM users WHERE phone=%s", (req.phone,))
-        user = db.fetchone()
+    try:
+        with get_db() as db:
+            db.execute("SELECT * FROM users WHERE phone=%s", (req.phone,))
+            user = db.fetchone()
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] login failed: {e}")
+        raise HTTPException(500, f"数据库连接失败，请检查 MySQL 配置: {str(e)}")
 
     if not user:
         raise HTTPException(404, "手机号未注册，请先注册")
@@ -419,31 +449,37 @@ class SaveSubAccountsReq(BaseModel):
 def find_subaccount(sub_phone: str):
     """遍历所有用户的 userdata，查找 subAccounts 中包含该手机号的记录。
     匿名访问（登录前查询），找到后自动为子账号创建有效 session token。"""
-    with get_db() as db:
-        db.execute("SELECT phone, data FROM userdata")
-        rows = db.fetchall()
-        for row in rows:
-            data = json.loads(row["data"])
-            subs = data.get("subAccounts", [])
-            for sub in subs:
-                if str(sub.get("phone", "")) == sub_phone:
-                    parent_phone = row["phone"]
-                    token = secrets.token_hex(32)
-                    expire = (datetime.now() + timedelta(days=TOKEN_TTL)).isoformat()
-                    db.execute(
-                        "INSERT INTO sessions (token, phone, expire_at) VALUES (%s,%s,%s)",
-                        (token, parent_phone, expire),
-                    )
-                    db.execute("SELECT phone, name, expire_at FROM users WHERE phone=%s", (parent_phone,))
-                    parent = db.fetchone()
-                    return {
-                        "parentPhone": parent_phone,
-                        "parentName": parent["name"] if parent else parent_phone,
-                        "expireAt": parent["expire_at"].isoformat() if parent and parent["expire_at"] else None,
-                        "subAccount": sub,
-                        "token": token
-                    }
-    raise HTTPException(404, "子账号不存在")
+    try:
+        with get_db() as db:
+            db.execute("SELECT phone, data FROM userdata")
+            rows = db.fetchall()
+            for row in rows:
+                data = json.loads(row["data"])
+                subs = data.get("subAccounts", [])
+                for sub in subs:
+                    if str(sub.get("phone", "")) == sub_phone:
+                        parent_phone = row["phone"]
+                        token = secrets.token_hex(32)
+                        expire = (datetime.now() + timedelta(days=TOKEN_TTL)).isoformat()
+                        db.execute(
+                            "INSERT INTO sessions (token, phone, expire_at) VALUES (%s,%s,%s)",
+                            (token, parent_phone, expire),
+                        )
+                        db.execute("SELECT phone, name, expire_at FROM users WHERE phone=%s", (parent_phone,))
+                        parent = db.fetchone()
+                        return {
+                            "parentPhone": parent_phone,
+                            "parentName": parent["name"] if parent else parent_phone,
+                            "expireAt": parent["expire_at"].isoformat() if parent and parent["expire_at"] else None,
+                            "subAccount": sub,
+                            "token": token
+                        }
+        raise HTTPException(404, "子账号不存在")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] find_subaccount failed: {e}")
+        raise HTTPException(500, f"数据库连接失败，请检查 MySQL 配置: {str(e)}")
 
 
 @app.put("/api/subaccounts", summary="保存当前用户的子账号列表")
